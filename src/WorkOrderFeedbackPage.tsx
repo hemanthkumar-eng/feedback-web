@@ -1,17 +1,14 @@
 import type { FormEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
+import {
+  type AnswerInput,
+  type Question,
+  FeedbackError,
+  getFeedbackForm,
+  submitFeedback,
+} from "./api/feedback";
 import "./work-order-feedback.css";
-
-type ChoiceOption = {
-  value: string;
-  tone: "positive" | "neutral" | "negative" | "warning";
-};
-
-type ChoiceQuestion = {
-  id: string;
-  label: string;
-  options: ChoiceOption[];
-};
 
 const RATING_LABELS: Record<number, string> = {
   1: "Very dissatisfied",
@@ -21,246 +18,257 @@ const RATING_LABELS: Record<number, string> = {
   5: "Very satisfied",
 };
 
-const INITIAL_QUESTIONS: ChoiceQuestion[] = [
-  {
-    id: "care-support",
-    label: "Did the environment support safe patient care today?",
-    options: [
-      { value: "No", tone: "negative" },
-      { value: "Somewhat", tone: "warning" },
-      { value: "Yes", tone: "positive" },
-    ],
-  },
-  {
-    id: "disruption",
-    label: "Did Facilities issues delay or disrupt clinical work today?",
-    options: [
-      { value: "Yes, caused disruption", tone: "negative" },
-      { value: "Minor impact", tone: "warning" },
-      { value: "No disruption", tone: "positive" },
-    ],
-  },
-  {
-    id: "trust",
-    label: "Do you trust Facilities to resolve issues reliably when needed?",
-    options: [
-      { value: "Low trust", tone: "negative" },
-      { value: "Neutral", tone: "neutral" },
-      { value: "High trust", tone: "positive" },
-    ],
-  },
-  {
-    id: "timely-response",
-    label: "Was the response time acceptable for this work order?",
-    options: [
-      { value: "No", tone: "negative" },
-      { value: "Somewhat", tone: "warning" },
-      { value: "Yes", tone: "positive" },
-    ],
-  },
-  {
-    id: "communication",
-    label: "Were updates and communication clear during the process?",
-    options: [
-      { value: "No", tone: "negative" },
-      { value: "Somewhat", tone: "warning" },
-      { value: "Yes", tone: "positive" },
-    ],
-  },
-];
+type OptionTone = "positive" | "neutral" | "negative" | "warning";
+
+function getOptionTone(index: number, total: number): OptionTone {
+  if (total <= 0) return "neutral";
+  if (index === 0) return "positive";
+  if (index === total - 1) return "negative";
+  if (index === 1 && total > 2) return "warning";
+  return "neutral";
+}
+
+const SORTED_QUESTIONS = (questions: Question[]): Question[] =>
+  [...questions].sort((a, b) => a.display_order - b.display_order);
 
 export default function WorkOrderFeedbackPage() {
-  const [rating, setRating] = useState<number | null>(null);
-  const [questions, setQuestions] =
-    useState<ChoiceQuestion[]>(INITIAL_QUESTIONS);
+  const { token } = useParams<{ token: string }>();
+  const [form, setForm] = useState<{ work_order_id: number; questions: Question[] } | null>(null);
+  const [loadState, setLoadState] = useState<"loading" | "idle" | "error">("loading");
+  const [loadError, setLoadError] = useState<{ code: string; message: string } | null>(null);
+
   const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [newQuestionLabel, setNewQuestionLabel] = useState("");
-  const [newOptions, setNewOptions] = useState([
-    { value: "Yes", tone: "positive" as ChoiceOption["tone"] },
-    { value: "Somewhat", tone: "warning" as ChoiceOption["tone"] },
-    { value: "No", tone: "negative" as ChoiceOption["tone"] },
-  ]);
+  const [extraQuestionText, setExtraQuestionText] = useState("");
+  const [extraQuestionAnswer, setExtraQuestionAnswer] = useState("");
   const [step, setStep] = useState(0);
-  const [flashTarget, setFlashTarget] = useState<"next" | "submit" | null>(
-    null
-  );
-  const [submitState, setSubmitState] = useState<
-    "idle" | "submitting" | "success"
-  >("idle");
+  const [flashTarget, setFlashTarget] = useState<"next" | "submit" | null>(null);
+  const [submitState, setSubmitState] = useState<"idle" | "submitting" | "success">("idle");
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [showErrors, setShowErrors] = useState(false);
   const [submitArmed, setSubmitArmed] = useState(false);
   const flashTimeout = useRef<number | null>(null);
 
-  const answeredCount = useMemo(() => Object.keys(answers).length, [answers]);
-  const hasRating = rating !== null;
-  const totalSteps = 1 + questions.length + 2;
-  const isRatingStep = step === 0;
-  const isQuestionStep = step > 0 && step <= questions.length;
-  const questionIndex = isQuestionStep ? step - 1 : -1;
-  const activeQuestion = isQuestionStep ? questions[questionIndex] : null;
-  const finalStep = questions.length + 1;
-  const successStep = questions.length + 2;
-  const isFinalStep = step === finalStep;
-  const isSuccessStep = step === successStep;
-  const isValid = hasRating && answeredCount === questions.length;
-  const progressTotalSteps = totalSteps - 1;
+  const questions = useMemo(
+    () => (form ? SORTED_QUESTIONS(form.questions) : []),
+    [form]
+  );
+  const workOrderId = form?.work_order_id ?? 0;
 
-  const currentStepValid = isRatingStep
-    ? hasRating
-    : isQuestionStep
-    ? Boolean(activeQuestion && answers[activeQuestion.id])
-    : true;
+  const totalSteps = questions.length + 1;
+  const isAddQuestionStep = step === questions.length;
+  const isSuccessStep = submitState === "success";
+  const currentQuestion = step < questions.length ? questions[step] : null;
+  const progressTotalSteps = totalSteps;
+
+  const hasCurrentAnswer =
+    !currentQuestion ||
+    currentQuestion.question_type === "free_text" ||
+    (currentQuestion.question_type === "rating"
+      ? answers[currentQuestion.id] !== undefined && answers[currentQuestion.id] !== ""
+      : (answers[currentQuestion.id] ?? "").trim() !== "");
+
+  const allRequiredAnswered = questions.every((q) => {
+    if (q.question_type === "free_text") return true;
+    const v = answers[q.id];
+    return v !== undefined && String(v).trim() !== "";
+  });
+
+  const isValid = allRequiredAnswered;
+  const currentStepValid =
+    isAddQuestionStep || hasCurrentAnswer;
+
+  useEffect(() => {
+    if (!token) {
+      setLoadError({ code: "not_found", message: "Missing feedback link." });
+      setLoadState("error");
+      return;
+    }
+    let cancelled = false;
+    setLoadState("loading");
+    setLoadError(null);
+    getFeedbackForm(token)
+      .then((data) => {
+        if (!cancelled) {
+          setForm({ work_order_id: data.work_order_id, questions: data.questions });
+          setLoadState("idle");
+        }
+      })
+      .catch((err) => {
+        if (!cancelled && err instanceof FeedbackError) {
+          setLoadError({ code: err.code, message: err.message });
+        } else if (!cancelled) {
+          setLoadError({
+            code: "server_error",
+            message: "Something went wrong. Please try again later.",
+          });
+        }
+        if (!cancelled) setLoadState("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  useEffect(() => {
+    setStep((prev) => Math.min(prev, totalSteps - 1));
+  }, [totalSteps]);
+
+  useEffect(() => {
+    return () => {
+      if (flashTimeout.current) window.clearTimeout(flashTimeout.current);
+    };
+  }, []);
+
+  const triggerFlash = useCallback((target: "next" | "submit") => {
+    if (flashTimeout.current) window.clearTimeout(flashTimeout.current);
+    setFlashTarget(null);
+    window.setTimeout(() => {
+      setFlashTarget(target);
+      flashTimeout.current = window.setTimeout(() => setFlashTarget(null), 450);
+    }, 0);
+  }, []);
+
+  const handleNext = useCallback(() => {
+    setShowErrors(true);
+    if (!currentStepValid || submitState === "submitting") return;
+    setShowErrors(false);
+    setSubmitError(null);
+    setStep((prev) => Math.min(prev + 1, totalSteps - 1));
+  }, [currentStepValid, submitState, totalSteps]);
+
+  const handleBack = useCallback(() => {
+    setShowErrors(false);
+    setSubmitError(null);
+    setStep((prev) => Math.max(prev - 1, 0));
+  }, []);
+
+  const handleSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      setShowErrors(true);
+      if (!token || !form) return;
+      if (!isAddQuestionStep || !submitArmed) return;
+      if (!isValid || submitState === "submitting") return;
+
+      setSubmitState("submitting");
+      setSubmitArmed(false);
+      setSubmitError(null);
+
+      const answerList: AnswerInput[] = questions.map((q) => ({
+        question_id: q.id,
+        answer_value: answers[q.id] ?? "",
+      }));
+      if (extraQuestionText.trim() && extraQuestionAnswer.trim()) {
+        answerList.push({
+          question_id: null,
+          question_text: extraQuestionText.trim(),
+          answer_value: extraQuestionAnswer.trim(),
+        });
+      }
+
+      submitFeedback(token, { answers: answerList })
+        .then(() => {
+          setSubmitState("success");
+        })
+        .catch((err) => {
+          setSubmitState("idle");
+          setSubmitArmed(true);
+          if (err instanceof FeedbackError) {
+            setSubmitError(err.message);
+          } else {
+            setSubmitError("Something went wrong. Please try again.");
+          }
+        });
+    },
+    [
+      token,
+      form,
+      isAddQuestionStep,
+      submitArmed,
+      isValid,
+      submitState,
+      questions,
+      answers,
+      extraQuestionText,
+      extraQuestionAnswer,
+    ]
+  );
 
   useEffect(() => {
     setSubmitArmed(false);
   }, [step]);
 
-  useEffect(() => {
-    setStep((prev) => Math.min(prev, successStep));
-    setAnswers((prev) => {
-      const next: Record<string, string> = {};
-      questions.forEach((question) => {
-        const current = prev[question.id];
-        if (current) {
-          next[question.id] = current;
-        }
-      });
-      return next;
-    });
-  }, [questions, successStep]);
+  if (loadState === "loading") {
+    return (
+      <div className="wof-page">
+        <div className="wof-shell">
+          <header className="wof-header">
+            <div className="wof-logo" aria-hidden="true">
+              FM360
+            </div>
+            <div>
+              <p className="wof-eyebrow">Work Order Feedback</p>
+              <h1>Loading...</h1>
+            </div>
+          </header>
+          <main className="wof-card">
+            <p className="wof-meta" aria-live="polite">
+              Loading your feedback form.
+            </p>
+          </main>
+        </div>
+      </div>
+    );
+  }
 
-  useEffect(() => {
-    return () => {
-      if (flashTimeout.current) {
-        window.clearTimeout(flashTimeout.current);
-      }
-    };
-  }, []);
+  if (loadState === "error" && loadError) {
+    const isAlreadySubmitted = loadError.code === "already_submitted";
+    return (
+      <div className="wof-page">
+        <div className="wof-shell">
+          <header className="wof-header">
+            <div className="wof-logo" aria-hidden="true">
+              FM360
+            </div>
+            <div>
+              <p className="wof-eyebrow">Work Order Feedback</p>
+              <h1>{isAlreadySubmitted ? "Already submitted" : "Link invalid"}</h1>
+            </div>
+          </header>
+          <main className="wof-card">
+            <p className="wof-meta" role="alert">
+              {loadError.message}
+            </p>
+          </main>
+        </div>
+      </div>
+    );
+  }
 
-  const triggerFlash = (target: "next" | "submit") => {
-    if (flashTimeout.current) {
-      window.clearTimeout(flashTimeout.current);
-    }
-    setFlashTarget(null);
-    window.setTimeout(() => {
-      setFlashTarget(target);
-      flashTimeout.current = window.setTimeout(() => {
-        setFlashTarget(null);
-      }, 450);
-    }, 0);
-  };
+  if (!form || questions.length === 0) {
+    return (
+      <div className="wof-page">
+        <div className="wof-shell">
+          <header className="wof-header">
+            <div className="wof-logo" aria-hidden="true">
+              FM360
+            </div>
+            <div>
+              <p className="wof-eyebrow">Work Order Feedback</p>
+              <h1>No questions</h1>
+            </div>
+          </header>
+          <main className="wof-card">
+            <p className="wof-meta">There are no questions configured for this feedback link.</p>
+          </main>
+        </div>
+      </div>
+    );
+  }
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setShowErrors(true);
-
-    if (!isFinalStep || !submitArmed) {
-      return;
-    }
-
-    if (!isValid || submitState === "submitting") {
-      return;
-    }
-
-    setSubmitState("submitting");
-    setSubmitArmed(false);
-
-    const payload = {
-      workOrderId: "WO-12345",
-      rating,
-      answers,
-      submittedAt: new Date().toISOString(),
-    };
-
-    // Mock API call placeholder. Replace with a real API request.
-    window.setTimeout(() => {
-      void payload;
-      setSubmitState("success");
-      setStep(successStep);
-    }, 900);
-  };
-
-  const ratingError = showErrors && isRatingStep && !hasRating;
+  const ratingError = showErrors && currentQuestion?.question_type === "rating" && !hasCurrentAnswer;
   const questionError =
-    showErrors &&
-    isQuestionStep &&
-    Boolean(activeQuestion && !answers[activeQuestion.id]);
-
-  const handleNext = () => {
-    setShowErrors(true);
-    if (!currentStepValid || submitState === "submitting") {
-      return;
-    }
-    setShowErrors(false);
-    setStep((prev) => Math.min(prev + 1, totalSteps - 1));
-  };
-
-  const handleBack = () => {
-    setShowErrors(false);
-    setStep((prev) => Math.max(prev - 1, 0));
-  };
-
-  const createId = () => `q-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-
-
-  const updateNewOptionValue = (index: number, value: string) => {
-    setNewOptions((prev) =>
-      prev.map((option, optionIndex) =>
-        optionIndex === index ? { ...option, value } : option,
-      ),
-    );
-  };
-
-  const updateNewOptionTone = (
-    index: number,
-    tone: ChoiceOption["tone"],
-  ) => {
-    setNewOptions((prev) =>
-      prev.map((option, optionIndex) =>
-        optionIndex === index ? { ...option, tone } : option,
-      ),
-    );
-  };
-
-  const addNewOption = () => {
-    setNewOptions((prev) => [
-      ...prev,
-      { value: "New option", tone: "neutral" },
-    ]);
-  };
-
-  const removeNewOption = (index: number) => {
-    setNewOptions((prev) =>
-      prev.filter((_, optionIndex) => optionIndex !== index),
-    );
-  };
-
-  const handleAddNewQuestion = () => {
-    const label = newQuestionLabel.trim();
-    if (!label) {
-      return;
-    }
-    const id = createId();
-    const nextStep = questions.length + 1;
-    setQuestions((prev) => [
-      ...prev,
-      {
-        id,
-        label,
-        options: newOptions.map((option) => ({
-          value: option.value.trim() || "Option",
-          tone: option.tone,
-        })),
-      },
-    ]);
-    setStep(nextStep);
-    setNewQuestionLabel("");
-    setNewOptions([
-      { value: "Yes", tone: "positive" },
-      { value: "Somewhat", tone: "warning" },
-      { value: "No", tone: "negative" },
-    ]);
-  };
+    showErrors && currentQuestion && currentQuestion.question_type !== "rating" && !hasCurrentAnswer;
 
   return (
     <div className="wof-page">
@@ -276,115 +284,129 @@ export default function WorkOrderFeedbackPage() {
         </header>
 
         <main className="wof-card" aria-live="polite">
-          {isRatingStep ? (
+          {step === 0 && (
             <p className="wof-intro">
               <span className="wof-intro-line">
-                Work Order <strong>#WO-12345</strong> | Room <strong>9B</strong>{" "}
-                | <strong>HVAC</strong>
+                Work Order <strong>#{workOrderId}</strong>
               </span>
               <span className="wof-intro-line">
                 Your input helps us improve reliability and patient safety.
               </span>
             </p>
-          ) : null}
+          )}
 
           <form onSubmit={handleSubmit} noValidate>
-            {!isSuccessStep ? (
+            {!isSuccessStep && (
               <section className="wof-section wof-progress">
                 <span className="wof-meta">
                   Step {step + 1} of {progressTotalSteps}
                 </span>
               </section>
-            ) : null}
+            )}
 
-            {isRatingStep ? (
+            {currentQuestion && (
               <section className="wof-section">
-                <fieldset className="wof-fieldset">
-                  <legend>Overall satisfaction</legend>
-                  <div className="wof-stars-row">
-                    <div className="wof-stars" role="radiogroup">
-                      {[1, 2, 3, 4, 5].map((value) => (
-                        <label key={value} className="wof-star">
-                          <input
-                            type="radio"
-                            name="overallRating"
-                            value={value}
-                            checked={rating === value}
-                            onChange={() => {
-                              setRating(value);
-                            }}
-                            aria-label={`${value} star${value > 1 ? "s" : ""}`}
-                          />
-                          <span aria-hidden="true">★</span>
-                        </label>
-                      ))}
+                {currentQuestion.question_type === "rating" && (
+                  <fieldset className="wof-fieldset">
+                    <legend>{currentQuestion.question_text}</legend>
+                    <div className="wof-stars-row">
+                      <div className="wof-stars" role="radiogroup">
+                        {([1, 2, 3, 4, 5] as const).map((value) => (
+                          <label key={value} className="wof-star">
+                            <input
+                              type="radio"
+                              name={`q-${currentQuestion.id}`}
+                              value={String(value)}
+                              checked={answers[currentQuestion.id] === String(value)}
+                              onChange={() =>
+                                setAnswers((prev) => ({
+                                  ...prev,
+                                  [currentQuestion.id]: String(value),
+                                }))
+                              }
+                              aria-label={`${value} star${value > 1 ? "s" : ""}`}
+                            />
+                            <span aria-hidden="true">★</span>
+                          </label>
+                        ))}
+                      </div>
+                      {answers[currentQuestion.id] && (
+                        <span className="wof-rating-text" role="status">
+                          {RATING_LABELS[Number(answers[currentQuestion.id])]}
+                        </span>
+                      )}
                     </div>
-                    {rating !== null ? (
-                      <span className="wof-rating-text" role="status">
-                        {RATING_LABELS[rating]}
-                      </span>
-                    ) : null}
-                  </div>
-                  {ratingError ? (
-                    <p className="wof-error" role="alert">
-                      Please select a rating.
-                    </p>
-                  ) : null}
-                </fieldset>
+                    {ratingError && (
+                      <p className="wof-error" role="alert">
+                        Please select a rating.
+                      </p>
+                    )}
+                  </fieldset>
+                )}
+
+                {currentQuestion.question_type === "multiple_choice" && (
+                  <fieldset className="wof-fieldset">
+                    <legend>{currentQuestion.question_text}</legend>
+                    <div className="wof-options">
+                      {(currentQuestion.options ?? []).map((optionValue, idx) => {
+                        const tone = getOptionTone(idx, currentQuestion.options!.length);
+                        return (
+                          <label
+                            key={optionValue}
+                            className={[
+                              "wof-option",
+                              `wof-option--${tone}`,
+                              answers[currentQuestion.id] === optionValue ? "is-selected" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                          >
+                            <input
+                              type="radio"
+                              name={`q-${currentQuestion.id}`}
+                              value={optionValue}
+                              checked={answers[currentQuestion.id] === optionValue}
+                              onChange={() =>
+                                setAnswers((prev) => ({
+                                  ...prev,
+                                  [currentQuestion.id]: optionValue,
+                                }))
+                              }
+                            />
+                            <span>{optionValue}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                    {questionError && (
+                      <p className="wof-error" role="alert">
+                        Please select an option to continue.
+                      </p>
+                    )}
+                  </fieldset>
+                )}
+
+                {currentQuestion.question_type === "free_text" && (
+                  <fieldset className="wof-fieldset">
+                    <legend>{currentQuestion.question_text}</legend>
+                    <textarea
+                      className="wof-input"
+                      rows={4}
+                      placeholder="Your response (optional)"
+                      value={answers[currentQuestion.id] ?? ""}
+                      onChange={(e) =>
+                        setAnswers((prev) => ({
+                          ...prev,
+                          [currentQuestion.id]: e.target.value,
+                        }))
+                      }
+                    />
+                  </fieldset>
+                )}
               </section>
-            ) : null}
+            )}
 
-            {isQuestionStep && activeQuestion ? (
-              <section className="wof-section">
-                <div className="wof-section-header">
-                  <h2>Quick check-in</h2>
-                  <span className="wof-meta">
-                    Answer each question to continue
-                  </span>
-                </div>
-                <fieldset className="wof-fieldset">
-                  <legend>{activeQuestion.label}</legend>
-                  <div className="wof-options">
-                    {activeQuestion.options.map((option) => (
-                      <label
-                        key={option.value}
-                        className={[
-                          "wof-option",
-                          `wof-option--${option.tone}`,
-                          answers[activeQuestion.id] === option.value
-                            ? "is-selected"
-                            : "",
-                        ]
-                          .filter(Boolean)
-                          .join(" ")}
-                      >
-                        <input
-                          type="radio"
-                          name={`question-${activeQuestion.id}`}
-                          value={option.value}
-                          checked={answers[activeQuestion.id] === option.value}
-                          onChange={() => {
-                            setAnswers((prev) => ({
-                              ...prev,
-                              [activeQuestion.id]: option.value,
-                            }));
-                          }}
-                        />
-                        <span>{option.value}</span>
-                      </label>
-                    ))}
-                  </div>
-                </fieldset>
-
-                {questionError ? (
-                  <p className="wof-error" role="alert">
-                    Please answer this question to continue.
-                  </p>
-                ) : null}
-              </section>
-            ) : null}
-
-            {isFinalStep ? (
+            {isAddQuestionStep && (
               <>
                 <section className="wof-section">
                   <div className="wof-section-header">
@@ -400,83 +422,38 @@ export default function WorkOrderFeedbackPage() {
                     You can still go back to make changes before submitting.
                   </p>
                 </section>
-
                 <section className="wof-section">
-                  <label className="wof-label" htmlFor="new-question">
-                    Question text
+                  <label className="wof-label" htmlFor="extra-question-text">
+                    Your question
                   </label>
                   <input
-                    id="new-question"
+                    id="extra-question-text"
                     className="wof-input"
                     type="text"
                     placeholder="Enter your question"
-                    value={newQuestionLabel}
-                    onChange={(event) =>
-                      setNewQuestionLabel(event.target.value)
-                    }
+                    value={extraQuestionText}
+                    onChange={(e) => setExtraQuestionText(e.target.value)}
                   />
-                  <div className="wof-editor-options">
-                    {newOptions.map((option, optionIndex) => (
-                      <div
-                        key={`new-${optionIndex}`}
-                        className={`wof-editor-option wof-editor-option--${option.tone}`}
-                      >
-                        <input
-                          className="wof-input"
-                          type="text"
-                          value={option.value}
-                          onChange={(event) =>
-                            updateNewOptionValue(
-                              optionIndex,
-                              event.target.value,
-                            )
-                          }
-                        />
-                        <select
-                          className="wof-select"
-                          value={option.tone}
-                          onChange={(event) =>
-                            updateNewOptionTone(
-                              optionIndex,
-                              event.target.value as ChoiceOption["tone"],
-                            )
-                          }
-                        >
-                          <option value="positive">Positive</option>
-                          <option value="neutral">Neutral</option>
-                          <option value="warning">Warning</option>
-                          <option value="negative">Negative</option>
-                        </select>
-                        <button
-                          type="button"
-                          className="wof-button wof-button--ghost"
-                          onClick={() => removeNewOption(optionIndex)}
-                          disabled={newOptions.length <= 2}
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    ))}
-                    <div className="wof-editor-row">
-                      <button
-                        type="button"
-                        className="wof-button wof-button--secondary wof-button--compact"
-                        onClick={addNewOption}
-                      >
-                        Add option
-                      </button>
-                      <button
-                        type="button"
-                        className="wof-button wof-button--compact"
-                        onClick={handleAddNewQuestion}
-                      >
-                        Add question
-                      </button>
-                    </div>
-                  </div>
+                  <label className="wof-label" htmlFor="extra-question-answer" style={{ marginTop: 12 }}>
+                    Your answer
+                  </label>
+                  <input
+                    id="extra-question-answer"
+                    className="wof-input"
+                    type="text"
+                    placeholder="Enter your answer"
+                    value={extraQuestionAnswer}
+                    onChange={(e) => setExtraQuestionAnswer(e.target.value)}
+                  />
                 </section>
               </>
-            ) : null}
+            )}
+
+            {submitError && (
+              <p className="wof-error" role="alert" style={{ marginBottom: 12 }}>
+                {submitError}
+              </p>
+            )}
 
             {!isSuccessStep ? (
               <div className="wof-actions">
@@ -489,7 +466,7 @@ export default function WorkOrderFeedbackPage() {
                   >
                     Back
                   </button>
-                  {isFinalStep ? (
+                  {isAddQuestionStep ? (
                     <button
                       type="submit"
                       className={[
@@ -527,13 +504,12 @@ export default function WorkOrderFeedbackPage() {
                       }}
                       disabled={submitState === "submitting"}
                     >
-                      {isRatingStep ? "Start" : "Next"}
+                      {step === 0 ? "Start" : "Next"}
                     </button>
                   )}
                 </div>
                 <p className="wof-hint">
-                  Responses are reviewed in aggregate for learning — not
-                  performance evaluation.
+                  Responses are reviewed in aggregate for learning — not performance evaluation.
                 </p>
               </div>
             ) : (
